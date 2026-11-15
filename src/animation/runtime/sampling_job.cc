@@ -31,6 +31,10 @@
 #include <cassert>
 #include <limits>
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+
 #include "ozz/animation/runtime/animation.h"
 #include "ozz/base/encode/group_varint.h"
 #include "ozz/base/maths/math_constant.h"
@@ -47,10 +51,16 @@ namespace animation {
 
 namespace internal {
 struct InterpSoaFloat3 {
+  // ratio[0] is the left key ratio, ratio[1] is the reciprocal of the
+  // right-left key ratio interval. value[0] is the left key and value[1] is
+  // the difference between right and left keys.
   math::SimdFloat4 ratio[2];
   math::SoaFloat3 value[2];
 };
 struct InterpSoaQuaternion {
+  // ratio[0] is the left key ratio, ratio[1] is the reciprocal of the
+  // right-left key ratio interval. value[0] is the left key and value[1] is
+  // the difference between right and left keys.
   math::SimdFloat4 ratio[2];
   math::SoaQuaternion value[2];
 };
@@ -77,21 +87,29 @@ bool SamplingJob::Validate() const {
 }
 
 namespace {
+OZZ_INLINE int TrailingZeros(uint32_t _value) {
+  assert(_value != 0);
+#if defined(_MSC_VER)
+  unsigned long index;
+  _BitScanForward(&index, _value);
+  return static_cast<int>(index);
+#else
+  return __builtin_ctz(_value);
+#endif
+}
+
 inline uint32_t TrackForward(const ozz::span<const uint32_t> _cache,
-                             const ozz::span<const uint16_t>& _previouses,
-                             uint32_t _key, uint32_t _last_track,
+                             uint32_t _target, uint32_t _last_track,
                              uint32_t _num_tracks) {
-  assert(_key < _previouses.size());
   assert(_last_track >= 0 && _last_track < _num_tracks);
 
-  const uint32_t target = _key - _previouses[_key];
   for (uint32_t entry = _last_track; entry < _num_tracks; ++entry) {
-    if (_cache[entry] == target) {
+    if (_cache[entry] == _target) {
       return entry;
     }
   }
   for (uint32_t entry = 0;; ++entry) {
-    if (_cache[entry] == target) {
+    if (_cache[entry] == _target) {
       return entry;
     }
     assert(entry < _last_track && "Previous track should be in cache");
@@ -116,15 +134,6 @@ inline uint32_t TrackBackward(const ozz::span<const uint32_t> _cache,
       return entry;
     }
     assert(entry > _last_track && "Previous track should be in cache");
-  }
-}
-
-inline float KeyRatio(const ozz::span<const float>& _timepoints,
-                      const ozz::span<const byte>& _ratios, size_t _at) {
-  if (_timepoints.size() <= std::numeric_limits<uint8_t>::max()) {
-    return _timepoints[reinterpret_span<const uint8_t>(_ratios)[_at]];
-  } else {
-    return _timepoints[reinterpret_span<const uint16_t>(_ratios)[_at]];
   }
 }
 
@@ -185,14 +194,17 @@ inline void OutdateCache(const ozz::span<byte>& _outdated,
 }
 
 // Loops through the sorted key frames and update cache structure.
-void UpdateCache(float _ratio, float _previous_ratio, size_t _num_soa_tracks,
-                 const ozz::span<const float>& _timepoints,
-                 const Animation::KeyframesCtrlConst& _ctrl,
-                 SamplingJob::Context::Cache& _cache) {
+template <typename _Ratio>
+void UpdateCacheImpl(float _ratio, float _previous_ratio,
+                     size_t _num_soa_tracks,
+                     const ozz::span<const float>& _timepoints,
+                     const Animation::KeyframesCtrlConst& _ctrl,
+                     SamplingJob::Context::Cache& _cache) {
   assert(_num_soa_tracks > 0);
   const uint32_t num_tracks = static_cast<uint32_t>(_num_soa_tracks * 4);
   assert(_ctrl.previouses.begin() + num_tracks * 2 <= _ctrl.previouses.end());
   const uint32_t num_keys = static_cast<uint32_t>(_ctrl.previouses.size());
+  const _Ratio* ratios = reinterpret_cast<const _Ratio*>(_ctrl.ratios.data());
 
   uint32_t next = _cache.next;
   assert(next == 0 || (next >= num_tracks * 2 && next <= num_keys));
@@ -231,46 +243,76 @@ void UpdateCache(float _ratio, float _previous_ratio, size_t _num_soa_tracks,
   // keys lower than _ratio have been processed, meaning all cache entries are
   // up to date.
   uint32_t track = 0;
-  for (; next < num_keys && KeyRatio(_timepoints, _ctrl.ratios,
-                                     next - _ctrl.previouses[next]) <= _ratio;
-       ++next) {
+  while (next < num_keys) {
+    const uint32_t previous = _ctrl.previouses[next];
+    const uint32_t target = next - previous;
+    if (_timepoints[ratios[target]] > _ratio) {
+      break;
+    }
+
     // Finds track index.
-    track =
-        TrackForward(_cache.entries, _ctrl.previouses, next, track, num_tracks);
-    assert(_cache.entries[track] == next - _ctrl.previouses[next] &&
-           "Wrong cache entry.");
+    track = TrackForward(_cache.entries, target, track, num_tracks);
+    assert(_cache.entries[track] == target && "Wrong cache entry.");
 
     // Flag this soa entry as outdated.
     _cache.outdated[track / 32] |= 1 << ((track & 0x1f) / 4);
 
     // Updates cache.
     _cache.entries[track] = next;
+    ++next;
   }
 
   // Rewinds.
   // Checks if the time of the penultimate key is greater than _ratio, in which
   // case we need to rewind.
-  for (; KeyRatio(_timepoints, _ctrl.ratios,
-                  (next - 1) - _ctrl.previouses[next - 1]) > _ratio;
-       --next) {
-    assert(next - 1 >= num_tracks * 2);
+  while (next - 1 >= num_tracks * 2) {
+    const uint32_t key = next - 1;
+    const uint32_t target = key - _ctrl.previouses[key];
+    if (_timepoints[ratios[target]] <= _ratio) {
+      break;
+    }
 
     // Finds track index.
-    track = TrackBackward(_cache.entries, next - 1, track, num_tracks);
+    track = TrackBackward(_cache.entries, key, track, num_tracks);
 
     // Flag this soa entry as outdated.
     _cache.outdated[track / 32] |= 1 << ((track & 0x1f) / 4);
 
     // Updates cache.
-    assert(_cache.entries[track] == next - 1);
+    assert(_cache.entries[track] == key);
     const uint32_t previous = _ctrl.previouses[_cache.entries[track]];
     assert(_cache.entries[track] >= previous + num_tracks);
     _cache.entries[track] -= previous;
+    --next;
   }
 
   // Updates next output.
   assert(next >= num_tracks * 2 && next <= num_keys);
   _cache.next = next;
+}
+
+void UpdateCache(float _ratio, float _previous_ratio, size_t _num_soa_tracks,
+                 const ozz::span<const float>& _timepoints,
+                 const Animation::KeyframesCtrlConst& _ctrl,
+                 SamplingJob::Context::Cache& _cache) {
+  if (_timepoints.size() <= std::numeric_limits<uint8_t>::max()) {
+    UpdateCacheImpl<uint8_t>(_ratio, _previous_ratio, _num_soa_tracks,
+                             _timepoints, _ctrl, _cache);
+  } else {
+    UpdateCacheImpl<uint16_t>(_ratio, _previous_ratio, _num_soa_tracks,
+                              _timepoints, _ctrl, _cache);
+  }
+}
+
+inline math::SoaFloat3 Delta(const math::SoaFloat3& _left,
+                             const math::SoaFloat3& _right) {
+  return {_right.x - _left.x, _right.y - _left.y, _right.z - _left.z};
+}
+
+inline math::SoaQuaternion Delta(const math::SoaQuaternion& _left,
+                                 const math::SoaQuaternion& _right) {
+  return {_right.x - _left.x, _right.y - _left.y, _right.z - _left.z,
+          _right.w - _left.w};
 }
 
 template <typename _CompressedKey, typename _DecompressedKey,
@@ -286,10 +328,9 @@ inline void Decompress(size_t _num_soa_tracks,
   for (size_t j = 0; j < num_outdated_flags; ++j) {
     byte outdated = _cache.outdated[j];  // Copy outdated flag
     _cache.outdated[j] = 0;  // Reset outdated entries as all will be processed.
-    for (size_t i = j * 8; outdated != 0; ++i, outdated >>= 1) {
-      if (!(outdated & 1)) {
-        continue;
-      }
+    while (outdated != 0) {
+      const size_t i = j * 8 + TrailingZeros(outdated);
+      outdated &= outdated - 1;
 
       // Get cache sub part matching this outdated soa entry.
       const auto& rights = _cache.entries.subspan(i * 4, 4);
@@ -306,7 +347,9 @@ inline void Decompress(size_t _num_soa_tracks,
       const _CompressedKey& k10 = _compressed[lefts[1]];
       const _CompressedKey& k20 = _compressed[lefts[2]];
       const _CompressedKey& k30 = _compressed[lefts[3]];
-      _decompressed[i].ratio[0] = KeysRatio(_timepoints, _ctrl.ratios, lefts);
+      const math::SimdFloat4 left_ratio =
+          KeysRatio(_timepoints, _ctrl.ratios, lefts);
+      _decompressed[i].ratio[0] = left_ratio;
       _decompress(k00, k10, k20, k30, &_decompressed[i].value[0]);
 
       // Decompress right side keyframes and store them in soa structures.
@@ -314,8 +357,12 @@ inline void Decompress(size_t _num_soa_tracks,
       const _CompressedKey& k11 = _compressed[rights[1]];
       const _CompressedKey& k21 = _compressed[rights[2]];
       const _CompressedKey& k31 = _compressed[rights[3]];
-      _decompressed[i].ratio[1] = KeysRatio(_timepoints, _ctrl.ratios, rights);
+      const math::SimdFloat4 right_ratio =
+          KeysRatio(_timepoints, _ctrl.ratios, rights);
+      _decompressed[i].ratio[1] = math::RcpEst(right_ratio - left_ratio);
       _decompress(k01, k11, k21, k31, &_decompressed[i].value[1]);
+      _decompressed[i].value[1] =
+          Delta(_decompressed[i].value[0], _decompressed[i].value[1]);
     }
   }
 }
@@ -382,15 +429,25 @@ inline void DecompressQuaternion(const internal::QuaternionKey& _k0,
                    math::simd_int4::LoadPtr(cmp_keys[3])) +
           kOffset};
 
-  // Zeroed largest components so they're not part of the dot.
-  const math::SimdInt4 mask_f000 = math::simd_int4::mask_f000();
-  const math::SimdInt4 mask_0f00 = math::simd_int4::mask_0f00();
-  const math::SimdInt4 mask_00f0 = math::simd_int4::mask_00f0();
-  const math::SimdInt4 mask_000f = math::simd_int4::mask_000f();
-  cpnt[largests[0]] = math::AndNot(cpnt[largests[0]], mask_f000);
-  cpnt[largests[1]] = math::AndNot(cpnt[largests[1]], mask_0f00);
-  cpnt[largests[2]] = math::AndNot(cpnt[largests[2]], mask_00f0);
-  cpnt[largests[3]] = math::AndNot(cpnt[largests[3]], mask_000f);
+  // Selects, for each output component, the lanes that store its largest
+  // component. This table-driven mask keeps cpnt in registers, avoiding
+  // variable-index writes through a temporary soa array.
+  const math::SimdInt4 largest = math::simd_int4::Load(
+      largests[0], largests[1], largests[2], largests[3]);
+  const math::SimdInt4 mask_x =
+      math::CmpEq(largest, math::simd_int4::zero());
+  const math::SimdInt4 mask_y =
+      math::CmpEq(largest, math::simd_int4::Load1(1));
+  const math::SimdInt4 mask_z =
+      math::CmpEq(largest, math::simd_int4::Load1(2));
+  const math::SimdInt4 mask_w =
+      math::CmpEq(largest, math::simd_int4::Load1(3));
+
+  // Zeroes largest components so they're not part of the dot.
+  cpnt[0] = math::AndNot(cpnt[0], mask_x);
+  cpnt[1] = math::AndNot(cpnt[1], mask_y);
+  cpnt[2] = math::AndNot(cpnt[2], mask_z);
+  cpnt[3] = math::AndNot(cpnt[3], mask_w);
 
   // Get back length of 4th component. Favors performance over accuracy by using
   // x * RSqrtEst(x) instead of Sqrt(x).
@@ -408,14 +465,10 @@ inline void DecompressQuaternion(const internal::QuaternionKey& _k0,
 
   // Re-injects the largest component inside the SoA structure.
   // Note that largest component is already 0.
-  cpnt[largests[0]] =
-      math::Or(cpnt[largests[0]], math::And(restored, mask_f000));
-  cpnt[largests[1]] =
-      math::Or(cpnt[largests[1]], math::And(restored, mask_0f00));
-  cpnt[largests[2]] =
-      math::Or(cpnt[largests[2]], math::And(restored, mask_00f0));
-  cpnt[largests[3]] =
-      math::Or(cpnt[largests[3]], math::And(restored, mask_000f));
+  cpnt[0] = math::Or(cpnt[0], math::And(restored, mask_x));
+  cpnt[1] = math::Or(cpnt[1], math::And(restored, mask_y));
+  cpnt[2] = math::Or(cpnt[2], math::And(restored, mask_z));
+  cpnt[3] = math::Or(cpnt[3], math::And(restored, mask_w));
 
   // Stores result.
   _quaternion->x = cpnt[0];
@@ -424,33 +477,167 @@ inline void DecompressQuaternion(const internal::QuaternionKey& _k0,
   _quaternion->w = cpnt[3];
 }
 
-void Interpolates(float _anim_ratio, size_t _num_soa_tracks,
-                  const span<const internal::InterpSoaFloat3>& _translations,
-                  const span<const internal::InterpSoaQuaternion>& _rotations,
-                  const span<const internal::InterpSoaFloat3>& _scales,
-                  const span<math::SoaTransform>& _output) {
-  const math::SimdFloat4 anim_ratio = math::simd_float4::Load1(_anim_ratio);
-  for (size_t i = 0; i < _num_soa_tracks; ++i) {
-    // Prepares interpolation coefficients.
-    const internal::InterpSoaFloat3& t = _translations[i];
-    const math::SimdFloat4 t_ratio =
-        (anim_ratio - t.ratio[0]) * math::RcpEst(t.ratio[1] - t.ratio[0]);
-    const internal::InterpSoaQuaternion& r = _rotations[i];
-    const math::SimdFloat4 r_ratio =
-        (anim_ratio - r.ratio[0]) * math::RcpEst(r.ratio[1] - r.ratio[0]);
-    const internal::InterpSoaFloat3& s = _scales[i];
-    const math::SimdFloat4 s_ratio =
-        (anim_ratio - s.ratio[0]) * math::RcpEst(s.ratio[1] - s.ratio[0]);
+struct DecompressFloat3Op {
+  OZZ_INLINE void operator()(const internal::Float3Key& _k0,
+                             const internal::Float3Key& _k1,
+                             const internal::Float3Key& _k2,
+                             const internal::Float3Key& _k3,
+                             math::SoaFloat3* _value) const {
+    DecompressFloat3(_k0, _k1, _k2, _k3, _value);
+  }
+};
 
-    // Processes interpolations.
-    // The lerp of the rotation uses the shortest path, because opposed
-    // quaternions were negated during animation build stage (see
-    // AnimationBuilder).
-    _output[i].translation = Lerp(t.value[0], t.value[1], t_ratio);
-    _output[i].rotation = NLerpEst(r.value[0], r.value[1], r_ratio);
-    _output[i].scale = Lerp(s.value[0], s.value[1], s_ratio);
+struct DecompressQuaternionOp {
+  OZZ_INLINE void operator()(const internal::QuaternionKey& _k0,
+                             const internal::QuaternionKey& _k1,
+                             const internal::QuaternionKey& _k2,
+                             const internal::QuaternionKey& _k3,
+                             math::SoaQuaternion* _value) const {
+    DecompressQuaternion(_k0, _k1, _k2, _k3, _value);
+  }
+};
+
+OZZ_INLINE math::SoaFloat3 LerpDelta(
+    const math::SoaFloat3& _left, const math::SoaFloat3& _delta,
+    const math::SimdFloat4& _ratio) {
+  return {math::MAdd(_delta.x, _ratio, _left.x),
+          math::MAdd(_delta.y, _ratio, _left.y),
+          math::MAdd(_delta.z, _ratio, _left.z)};
+}
+
+OZZ_INLINE math::SoaQuaternion NLerpEstDelta(
+    const math::SoaQuaternion& _left, const math::SoaQuaternion& _delta,
+    const math::SimdFloat4& _ratio) {
+  const math::SimdFloat4 x = math::MAdd(_delta.x, _ratio, _left.x);
+  const math::SimdFloat4 y = math::MAdd(_delta.y, _ratio, _left.y);
+  const math::SimdFloat4 z = math::MAdd(_delta.z, _ratio, _left.z);
+  const math::SimdFloat4 w = math::MAdd(_delta.w, _ratio, _left.w);
+  const math::SimdFloat4 len2 = x * x + y * y + z * z + w * w;
+  const math::SimdFloat4 inv_len = math::RSqrtEstNR(len2);
+  return {x * inv_len, y * inv_len, z * inv_len, w * inv_len};
+}
+
+OZZ_INLINE void Interpolate(
+    size_t _i, const math::SimdFloat4& _anim_ratio,
+    const internal::InterpSoaFloat3* OZZ_RESTRICT _translations,
+    const internal::InterpSoaQuaternion* OZZ_RESTRICT _rotations,
+    const internal::InterpSoaFloat3* OZZ_RESTRICT _scales,
+    math::SoaTransform* OZZ_RESTRICT _output) {
+  // Prepares interpolation coefficients.
+  const internal::InterpSoaFloat3& t = _translations[_i];
+  const math::SimdFloat4 t_ratio =
+      (_anim_ratio - t.ratio[0]) * t.ratio[1];
+  const internal::InterpSoaQuaternion& r = _rotations[_i];
+  const math::SimdFloat4 r_ratio =
+      (_anim_ratio - r.ratio[0]) * r.ratio[1];
+  const internal::InterpSoaFloat3& s = _scales[_i];
+  const math::SimdFloat4 s_ratio =
+      (_anim_ratio - s.ratio[0]) * s.ratio[1];
+
+  // Processes interpolations.
+  // The lerp of the rotation uses the shortest path, because opposed
+  // quaternions were negated during animation build stage (see
+  // AnimationBuilder).
+  _output[_i].translation = LerpDelta(t.value[0], t.value[1], t_ratio);
+  _output[_i].rotation = NLerpEstDelta(r.value[0], r.value[1], r_ratio);
+  _output[_i].scale = LerpDelta(s.value[0], s.value[1], s_ratio);
+}
+
+OZZ_INLINE void InterpolatePair(
+    size_t _i, const math::SimdFloat4& _anim_ratio,
+    const internal::InterpSoaFloat3* OZZ_RESTRICT _translations,
+    const internal::InterpSoaQuaternion* OZZ_RESTRICT _rotations,
+    const internal::InterpSoaFloat3* OZZ_RESTRICT _scales,
+    math::SoaTransform* OZZ_RESTRICT _output) {
+  const internal::InterpSoaFloat3& t0 = _translations[_i];
+  const internal::InterpSoaFloat3& t1 = _translations[_i + 1];
+  const math::SimdFloat4 t0_ratio =
+      (_anim_ratio - t0.ratio[0]) * t0.ratio[1];
+  const math::SimdFloat4 t1_ratio =
+      (_anim_ratio - t1.ratio[0]) * t1.ratio[1];
+  _output[_i].translation = LerpDelta(t0.value[0], t0.value[1], t0_ratio);
+  _output[_i + 1].translation =
+      LerpDelta(t1.value[0], t1.value[1], t1_ratio);
+
+  const internal::InterpSoaQuaternion& r0 = _rotations[_i];
+  const internal::InterpSoaQuaternion& r1 = _rotations[_i + 1];
+  const math::SimdFloat4 r0_ratio =
+      (_anim_ratio - r0.ratio[0]) * r0.ratio[1];
+  const math::SimdFloat4 r1_ratio =
+      (_anim_ratio - r1.ratio[0]) * r1.ratio[1];
+  _output[_i].rotation = NLerpEstDelta(r0.value[0], r0.value[1], r0_ratio);
+  _output[_i + 1].rotation =
+      NLerpEstDelta(r1.value[0], r1.value[1], r1_ratio);
+
+  const internal::InterpSoaFloat3& s0 = _scales[_i];
+  const internal::InterpSoaFloat3& s1 = _scales[_i + 1];
+  const math::SimdFloat4 s0_ratio =
+      (_anim_ratio - s0.ratio[0]) * s0.ratio[1];
+  const math::SimdFloat4 s1_ratio =
+      (_anim_ratio - s1.ratio[0]) * s1.ratio[1];
+  _output[_i].scale = LerpDelta(s0.value[0], s0.value[1], s0_ratio);
+  _output[_i + 1].scale = LerpDelta(s1.value[0], s1.value[1], s1_ratio);
+}
+
+OZZ_INLINE void InterpolateQuad(
+    size_t _i, const math::SimdFloat4& _anim_ratio,
+    const internal::InterpSoaFloat3* OZZ_RESTRICT _translations,
+    const internal::InterpSoaQuaternion* OZZ_RESTRICT _rotations,
+    const internal::InterpSoaFloat3* OZZ_RESTRICT _scales,
+    math::SoaTransform* OZZ_RESTRICT _output) {
+  const internal::InterpSoaFloat3* t[4] = {
+      &_translations[_i], &_translations[_i + 1],
+      &_translations[_i + 2], &_translations[_i + 3]};
+  for (int j = 0; j < 4; ++j) {
+    const math::SimdFloat4 ratio =
+        (_anim_ratio - t[j]->ratio[0]) * t[j]->ratio[1];
+    _output[_i + j].translation =
+        LerpDelta(t[j]->value[0], t[j]->value[1], ratio);
+  }
+
+  const internal::InterpSoaQuaternion* r[4] = {
+      &_rotations[_i], &_rotations[_i + 1],
+      &_rotations[_i + 2], &_rotations[_i + 3]};
+  for (int j = 0; j < 4; ++j) {
+    const math::SimdFloat4 ratio =
+        (_anim_ratio - r[j]->ratio[0]) * r[j]->ratio[1];
+    _output[_i + j].rotation =
+        NLerpEstDelta(r[j]->value[0], r[j]->value[1], ratio);
+  }
+
+  const internal::InterpSoaFloat3* s[4] = {
+      &_scales[_i], &_scales[_i + 1],
+      &_scales[_i + 2], &_scales[_i + 3]};
+  for (int j = 0; j < 4; ++j) {
+    const math::SimdFloat4 ratio =
+        (_anim_ratio - s[j]->ratio[0]) * s[j]->ratio[1];
+    _output[_i + j].scale =
+        LerpDelta(s[j]->value[0], s[j]->value[1], ratio);
   }
 }
+
+void Interpolates(float _anim_ratio, size_t _num_soa_tracks,
+                     const span<const internal::InterpSoaFloat3>& _translations,
+                     const span<const internal::InterpSoaQuaternion>& _rotations,
+                     const span<const internal::InterpSoaFloat3>& _scales,
+                     const span<math::SoaTransform>& _output) {
+  const math::SimdFloat4 anim_ratio = math::simd_float4::Load1(_anim_ratio);
+  const auto* translations = _translations.data();
+  const auto* rotations = _rotations.data();
+  const auto* scales = _scales.data();
+  auto* output = _output.data();
+  size_t i = 0;
+  for (; i + 3 < _num_soa_tracks; i += 4) {
+    InterpolateQuad(i, anim_ratio, translations, rotations, scales, output);
+  }
+  for (; i + 1 < _num_soa_tracks; i += 2) {
+    InterpolatePair(i, anim_ratio, translations, rotations, scales, output);
+  }
+  if (i < _num_soa_tracks) {
+    Interpolate(i, anim_ratio, translations, rotations, scales, output);
+  }
+}
+
 }  // namespace
 
 bool SamplingJob::Run() const {
@@ -485,7 +672,7 @@ bool SamplingJob::Run() const {
               context->translations_cache_);
   Decompress(num_soa_tracks, animation->timepoints(), translations_ctrl,
              animation->translations_values(), context->translations_cache_,
-             context->translations_, &DecompressFloat3);
+             context->translations_, DecompressFloat3Op{});
 
   // Rotations
   const Animation::KeyframesCtrlConst& rotations_ctrl =
@@ -495,7 +682,7 @@ bool SamplingJob::Run() const {
               context->rotations_cache_);
   Decompress(num_soa_tracks, animation->timepoints(), rotations_ctrl,
              animation->rotations_values(), context->rotations_cache_,
-             context->rotations_, &DecompressQuaternion);
+             context->rotations_, DecompressQuaternionOp{});
 
   // Scales
   const Animation::KeyframesCtrlConst& scales_ctrl = animation->scales_ctrl();
@@ -503,7 +690,7 @@ bool SamplingJob::Run() const {
               animation->timepoints(), scales_ctrl, context->scales_cache_);
   Decompress(num_soa_tracks, animation->timepoints(), scales_ctrl,
              animation->scales_values(), context->scales_cache_,
-             context->scales_, &DecompressFloat3);
+             context->scales_, DecompressFloat3Op{});
 
   // Only interp as much as we have output for.
   const size_t num_soa_interp_tracks = math::Min(output.size(), num_soa_tracks);
