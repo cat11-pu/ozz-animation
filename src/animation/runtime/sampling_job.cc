@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <limits>
 
 #include "ozz/animation/runtime/animation.h"
@@ -56,6 +57,46 @@ struct InterpSoaQuaternion {
 };
 }  // namespace internal
 
+namespace {
+
+// Keeps sampling deterministic for non-finite inputs. NaN is mapped to the
+// beginning of the animation.
+inline float ClampRatio(float _ratio) {
+  return _ratio >= 1.f ? 1.f : (_ratio > 0.f ? _ratio : 0.f);
+}
+
+template <typename _Key>
+bool ValidateKeyframes(const Animation::KeyframesCtrlConst& _ctrl,
+                       const span<const _Key>& _values,
+                       const span<const float>& _timepoints,
+                       size_t _min_keys) {
+  if (_ctrl.previouses.size() != _values.size() ||
+      _ctrl.previouses.size() < _min_keys || _timepoints.empty()) {
+    return false;
+  }
+
+  const size_t ratio_size =
+      _timepoints.size() <= std::numeric_limits<uint8_t>::max()
+          ? sizeof(uint8_t)
+          : sizeof(uint16_t);
+  if (_ctrl.ratios.size_bytes() != _values.size() * ratio_size) {
+    return false;
+  }
+
+  if ((_ctrl.iframe_desc.size() & 1) != 0) {
+    return false;
+  }
+  if (!_ctrl.iframe_desc.empty() &&
+      (!std::isfinite(_ctrl.iframe_interval) ||
+       _ctrl.iframe_interval <= 0.f)) {
+    return false;
+  }
+
+  return true;
+}
+
+}  // namespace
+
 bool SamplingJob::Validate() const {
   // Don't need any early out, as jobs are valid in most of the performance
   // critical cases.
@@ -72,6 +113,22 @@ bool SamplingJob::Validate() const {
 
   // Tests context size.
   valid &= context->max_soa_tracks() >= num_soa_tracks;
+
+  // A non-empty animation must provide at least two keyframes for every
+  // aligned track, otherwise the sampling cache would read out of bounds.
+  if (num_soa_tracks > 0) {
+    const size_t min_keys = static_cast<size_t>(num_soa_tracks) * 8;
+    const span<const float> timepoints = animation->timepoints();
+    valid &= ValidateKeyframes(animation->translations_ctrl(),
+                               animation->translations_values(), timepoints,
+                               min_keys);
+    valid &= ValidateKeyframes(animation->rotations_ctrl(),
+                               animation->rotations_values(), timepoints,
+                               min_keys);
+    valid &= ValidateKeyframes(animation->scales_ctrl(),
+                               animation->scales_values(), timepoints,
+                               min_keys);
+  }
 
   return valid;
 }
@@ -468,8 +525,8 @@ bool SamplingJob::Run() const {
     return true;
   }
 
-  // Clamps ratio in range [0,duration].
-  const float clamped_ratio = math::Clamp(0.f, ratio, 1.f);
+  // Clamps ratio in range [0,1].
+  const float clamped_ratio = ClampRatio(ratio);
 
   // Step the context to this potentially new animation and ratio.
   const float previous_ratio = context->Step(*animation, clamped_ratio);

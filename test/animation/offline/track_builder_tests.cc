@@ -92,6 +92,18 @@ TEST(Build, TrackBuilder) {
     EXPECT_TRUE(!builder(raw_float_track));
   }
 
+  {  // Building a track with a non-finite key frame's ratio fails.
+    RawFloatTrack raw_float_track;
+
+    const RawFloatTrack::Keyframe key = {
+        RawTrackInterpolation::kLinear,
+        std::numeric_limits<float>::quiet_NaN(), 0.f};
+    raw_float_track.keyframes.push_back(key);
+
+    EXPECT_FALSE(raw_float_track.Validate());
+    EXPECT_TRUE(!builder(raw_float_track));
+  }
+
   {  // Building a track with equal key frame's ratio fails.
     RawFloatTrack raw_float_track;
 

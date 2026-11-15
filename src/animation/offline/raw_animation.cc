@@ -26,6 +26,9 @@
 //----------------------------------------------------------------------------//
 
 #include "ozz/animation/offline/raw_animation.h"
+
+#include <cmath>
+
 #include "ozz/animation/runtime/skeleton.h"
 
 namespace ozz {
@@ -45,7 +48,8 @@ static bool ValidateTrack(const typename ozz::vector<_Key>& _track,
   for (size_t k = 0; k < _track.size(); ++k) {
     const float frame_time = _track[k].time;
     // Tests frame's time is in range [0:duration].
-    if (frame_time < 0.f || frame_time > _duration) {
+    if (!std::isfinite(frame_time) || frame_time < 0.f ||
+        frame_time > _duration) {
       return false;
     }
     // Tests that frames are sorted.
@@ -64,7 +68,7 @@ bool RawAnimation::JointTrack::Validate(float _duration) const {
 }
 
 bool RawAnimation::Validate() const {
-  if (duration <= 0.f) {  // Tests duration is valid.
+  if (!std::isfinite(duration) || duration <= 0.f) {  // Tests duration is valid.
     return false;
   }
   if (tracks.size() > Skeleton::kMaxJoints) {  // Tests number of tracks.

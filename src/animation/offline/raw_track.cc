@@ -27,6 +27,7 @@
 
 #include "ozz/animation/offline/raw_track.h"
 
+#include <cmath>
 #include <limits>
 
 #include "ozz/base/io/archive.h"
@@ -84,7 +85,8 @@ bool RawTrack<_ValueType>::Validate() const {
   for (size_t k = 0; k < keyframes.size(); ++k) {
     const float frame_ratio = keyframes[k].ratio;
     // Tests frame's ratio is in range [0:1].
-    if (frame_ratio < 0.f || frame_ratio > 1.f) {
+    if (!std::isfinite(frame_ratio) || frame_ratio < 0.f ||
+        frame_ratio > 1.f) {
       return false;
     }
     // Tests that frames are sorted.

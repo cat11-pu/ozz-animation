@@ -25,6 +25,10 @@
 //                                                                            //
 //----------------------------------------------------------------------------//
 
+#include <cmath>
+#include <iostream>
+#include <limits>
+
 #include "gtest/gtest.h"
 #include "ozz/animation/offline/raw_track.h"
 #include "ozz/animation/offline/track_builder.h"
@@ -37,8 +41,12 @@ using ozz::animation::Float2Track;
 using ozz::animation::Float3Track;
 using ozz::animation::Float4Track;
 using ozz::animation::FloatTrack;
+using ozz::animation::Float2TrackSamplingJob;
+using ozz::animation::Float3TrackSamplingJob;
+using ozz::animation::Float4TrackSamplingJob;
 using ozz::animation::FloatTrackSamplingJob;
 using ozz::animation::QuaternionTrack;
+using ozz::animation::QuaternionTrackSamplingJob;
 using ozz::animation::offline::RawFloatTrack;
 using ozz::animation::offline::RawTrackInterpolation;
 using ozz::animation::offline::TrackBuilder;
@@ -483,4 +491,152 @@ TEST(Quaternion, TrackSamplingJob) {
   sampling.ratio = 1.f;
   ASSERT_TRUE(sampling.Run());
   EXPECT_QUATERNION_EQ(result, 0.f, 0.f, 0.f, 1.f);
+}
+
+TEST(NonFiniteRatio, TrackSamplingJob) {
+  TrackBuilder builder;
+  RawFloatTrack raw_track;
+  raw_track.keyframes.push_back({RawTrackInterpolation::kLinear, 0.f, 0.f});
+  raw_track.keyframes.push_back({RawTrackInterpolation::kLinear, 1.f, 10.f});
+
+  ozz::unique_ptr<FloatTrack> track(builder(raw_track));
+  ASSERT_TRUE(track);
+
+  float result = 0.f;
+  FloatTrackSamplingJob sampling;
+  sampling.track = track.get();
+  sampling.result = &result;
+
+  struct {
+    float ratio;
+    float expected;
+  } cases[] = {
+      {std::numeric_limits<float>::quiet_NaN(), 0.f},
+      {std::numeric_limits<float>::infinity(), 10.f},
+      {-std::numeric_limits<float>::infinity(), 0.f},
+  };
+
+  for (const auto& test : cases) {
+    sampling.ratio = test.ratio;
+    result = 93.f;
+    EXPECT_TRUE(sampling.Validate());
+    EXPECT_TRUE(sampling.Run());
+    EXPECT_FLOAT_EQ(result, test.expected);
+    EXPECT_TRUE(std::isfinite(result));
+  }
+}
+
+TEST(EmptyTrack, TrackSamplingJob) {
+  FloatTrack track;
+  float result = 93.f;
+  FloatTrackSamplingJob sampling;
+  sampling.track = &track;
+  sampling.result = &result;
+  sampling.ratio = std::numeric_limits<float>::quiet_NaN();
+
+  EXPECT_TRUE(sampling.Validate());
+  EXPECT_TRUE(sampling.Run());
+  EXPECT_FLOAT_EQ(result, 0.f);
+  EXPECT_TRUE(std::isfinite(result));
+}
+
+namespace {
+
+bool IsFinite(float _value) { return std::isfinite(_value); }
+bool IsFinite(const ozz::math::Float2& _value) {
+  return std::isfinite(_value.x) && std::isfinite(_value.y);
+}
+bool IsFinite(const ozz::math::Float3& _value) {
+  return std::isfinite(_value.x) && std::isfinite(_value.y) &&
+         std::isfinite(_value.z);
+}
+bool IsFinite(const ozz::math::Float4& _value) {
+  return std::isfinite(_value.x) && std::isfinite(_value.y) &&
+         std::isfinite(_value.z) && std::isfinite(_value.w);
+}
+bool IsFinite(const ozz::math::Quaternion& _value) {
+  return std::isfinite(_value.x) && std::isfinite(_value.y) &&
+         std::isfinite(_value.z) && std::isfinite(_value.w);
+}
+
+template <typename _RawTrack, typename _Track, typename _Job>
+void ScanBoundaryRatios(bool _empty, const typename _Track::ValueType& _value0,
+                        const typename _Track::ValueType& _value1,
+                        int* _scanned, int* _non_finite, int* _failed) {
+  ozz::animation::offline::TrackBuilder builder;
+  _RawTrack raw_track;
+  if (!_empty) {
+    raw_track.keyframes.push_back(
+        {RawTrackInterpolation::kLinear, 0.f, _value0});
+    raw_track.keyframes.push_back(
+        {RawTrackInterpolation::kLinear, 1.f, _value1});
+  }
+
+  ozz::unique_ptr<_Track> built_track(builder(raw_track));
+  ASSERT_TRUE(built_track);
+  _Track default_track;
+  const _Track* track = _empty ? &default_track : built_track.get();
+
+  const float ratios[] = {
+      std::numeric_limits<float>::quiet_NaN(),
+      std::numeric_limits<float>::infinity(),
+      -std::numeric_limits<float>::infinity(),
+      -1.f,
+      -.25f,
+      0.f,
+      .25f,
+      1.f,
+      1.25f,
+  };
+
+  for (float ratio : ratios) {
+    typename _Track::ValueType result = _value0;
+    _Job job;
+    job.track = track;
+    job.result = &result;
+    job.ratio = ratio;
+    if (job.Run()) {
+      ++*_scanned;
+      *_non_finite += IsFinite(result) ? 0 : 1;
+    } else {
+      ++*_failed;
+    }
+  }
+}
+
+}  // namespace
+
+TEST(BoundaryScan, TrackSamplingJob) {
+  int scanned = 0;
+  int non_finite = 0;
+  int failed = 0;
+
+  for (bool empty : {false, true}) {
+    ScanBoundaryRatios<RawFloatTrack, FloatTrack, FloatTrackSamplingJob>(
+        empty, 1.f, 2.f, &scanned, &non_finite, &failed);
+    ScanBoundaryRatios<ozz::animation::offline::RawFloat2Track, Float2Track,
+                       Float2TrackSamplingJob>(
+        empty, ozz::math::Float2(1.f, 2.f), ozz::math::Float2(3.f, 4.f),
+        &scanned, &non_finite, &failed);
+    ScanBoundaryRatios<ozz::animation::offline::RawFloat3Track, Float3Track,
+                       Float3TrackSamplingJob>(
+        empty, ozz::math::Float3(1.f, 2.f, 3.f),
+        ozz::math::Float3(4.f, 5.f, 6.f), &scanned, &non_finite, &failed);
+    ScanBoundaryRatios<ozz::animation::offline::RawFloat4Track, Float4Track,
+                       Float4TrackSamplingJob>(
+        empty, ozz::math::Float4(1.f, 2.f, 3.f, 4.f),
+        ozz::math::Float4(5.f, 6.f, 7.f, 8.f), &scanned, &non_finite, &failed);
+    ScanBoundaryRatios<ozz::animation::offline::RawQuaternionTrack,
+                       QuaternionTrack, QuaternionTrackSamplingJob>(
+        empty, ozz::math::Quaternion::identity(),
+        ozz::math::Quaternion(0.f, .70710677f, 0.f, .70710677f), &scanned,
+        &non_finite, &failed);
+  }
+
+  std::cout << "track boundary scan: scanned=" << scanned
+            << " non_finite=" << non_finite << " failed=" << failed
+            << std::endl;
+  EXPECT_EQ(scanned, 90);
+  EXPECT_EQ(non_finite, 0);
+  EXPECT_EQ(failed, 0);
 }

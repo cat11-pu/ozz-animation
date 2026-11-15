@@ -25,6 +25,8 @@
 //                                                                            //
 //----------------------------------------------------------------------------//
 
+#include <limits>
+
 #include "gtest/gtest.h"
 #include "ozz/animation/offline/raw_track.h"
 #include "ozz/animation/offline/track_builder.h"
@@ -126,6 +128,19 @@ TEST(Empty, TrackEdgeTriggerJob) {
 
   ASSERT_TRUE(job.Run());
   EXPECT_EQ(iterator, job.end());
+}
+
+TEST(NonFiniteRange, TrackEdgeTriggerJob) {
+  FloatTrack track;
+  TrackTriggeringJob job;
+  job.track = &track;
+  TrackTriggeringJob::Iterator iterator;
+  job.iterator = &iterator;
+  job.from = std::numeric_limits<float>::quiet_NaN();
+  job.to = 1.f;
+
+  EXPECT_FALSE(job.Validate());
+  EXPECT_FALSE(job.Run());
 }
 
 TEST(Constant, TrackSamplingJob) {

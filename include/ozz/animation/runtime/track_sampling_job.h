@@ -43,6 +43,7 @@ struct TrackSamplingJob {
   typedef typename _Track::ValueType ValueType;
 
   // Validates all parameters.
+  // Returns false if the track value and keyframe buffers are inconsistent.
   bool Validate() const;
 
   // Validates and executes sampling.
@@ -50,7 +51,9 @@ struct TrackSamplingJob {
 
   // Ratio used to sample track, clamped in range [0,1] before job execution. 0
   // is the beginning of the track, 1 is the end. This is a ratio rather than a
-  // ratio because tracks have no duration.
+  // time because tracks have no duration.
+  // Non-finite values are deterministic: NaN maps to 0, -infinity to 0 and
+  // +infinity to 1.
   float ratio = 0.f;
 
   // Track to sample.

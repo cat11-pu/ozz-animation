@@ -28,6 +28,7 @@
 #include "framework/utils.h"
 
 #include <cassert>
+#include <cmath>
 #include <limits>
 
 #include "framework/imgui.h"
@@ -64,7 +65,14 @@ int PlaybackController::Update(const animation::Animation& _animation,
   float new_ratio = time_ratio_;
 
   if (play_) {
-    new_ratio = time_ratio_ + _dt * playback_speed_ / _animation.duration();
+    const float duration = _animation.duration();
+    if (std::isfinite(_dt) && std::isfinite(playback_speed_) &&
+        std::isfinite(duration) && duration > 0.f) {
+      new_ratio = time_ratio_ + _dt * playback_speed_ / duration;
+      if (!std::isfinite(new_ratio)) {
+        new_ratio = time_ratio_;
+      }
+    }
   }
 
   // Must be called even if time doesn't change, in order to update previous
@@ -78,6 +86,9 @@ int PlaybackController::set_time_ratio(float _ratio) {
   //  Number of loops completed within _ratio, possibly negative if going
   //  backward.
   previous_time_ratio_ = time_ratio_;
+  if (!std::isfinite(_ratio)) {
+    return 0;
+  }
   if (loop_) {
     // Split into integral and fractional parts.
     // frac in (-1,1), loopsf is integral part as float

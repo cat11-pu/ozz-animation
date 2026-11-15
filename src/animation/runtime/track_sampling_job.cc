@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 
 #include "ozz/animation/runtime/track.h"
 #include "ozz/base/maths/math_ex.h"
@@ -37,11 +38,25 @@ namespace ozz {
 namespace animation {
 namespace internal {
 
+namespace {
+
+// Keeps sampling deterministic for non-finite inputs. NaN is mapped to the
+// beginning of the track.
+inline float ClampRatio(float _ratio) {
+  return _ratio >= 1.f ? 1.f : (_ratio > 0.f ? _ratio : 0.f);
+}
+
+}  // namespace
+
 template <typename _Track>
 bool TrackSamplingJob<_Track>::Validate() const {
   bool success = true;
   success &= result != nullptr;
   success &= track != nullptr;
+  if (track != nullptr) {
+    success &= track->ratios().size() == track->values().size();
+    success &= track->steps().size() * 8 >= track->values().size();
+  }
   return success;
 }
 
@@ -51,6 +66,8 @@ bool TrackSamplingJob<_Track>::Run() const {
     return false;
   }
 
+  const float clamped_ratio = ClampRatio(ratio);
+
   // Search keyframes to interpolate.
   const span<const float> ratios = track->ratios();
   const span<const ValueType> values = track->values();
@@ -59,17 +76,22 @@ bool TrackSamplingJob<_Track>::Run() const {
 
   if (ratios.size() == 0) {  // Default (empty) track returns identity.
     *result = internal::TrackPolicy<ValueType>::identity();
-  } else if (ratios.size() == 1 || ratio <= 0.f) {
+  } else if (ratios.size() == 1 || clamped_ratio <= 0.f) {
     *result = values.front();
-  } else if (ratio >= 1.f) {
+  } else if (clamped_ratio >= 1.f) {
     *result = values.back();
   } else {
     // Search for the first key frame with a ratio value greater than input
     // ratio. Our ratio is between this one and the previous one.
-    const float* ptk1 = std::upper_bound(ratios.begin(), ratios.end(), ratio);
+    const float* ptk1 =
+        std::upper_bound(ratios.begin(), ratios.end(), clamped_ratio);
 
     // Deduce keys indices.
     const size_t id1 = ptk1 - ratios.begin();
+    if (id1 == 0) {
+      *result = values.front();
+      return true;
+    }
     const size_t id0 = id1 - 1;
 
     const bool id0step = (track->steps()[id0 / 8] & (1 << (id0 & 7))) != 0;
@@ -79,8 +101,16 @@ bool TrackSamplingJob<_Track>::Run() const {
       // Lerp relevant keys.
       const float tk0 = ratios[id0];
       const float tk1 = ratios[id1];
-      assert(ratio >= tk0 && ratio < tk1 && tk0 != tk1);
-      const float alpha = (ratio - tk0) / (tk1 - tk0);
+      assert(clamped_ratio >= tk0 && clamped_ratio < tk1 && tk0 != tk1);
+      if (!(tk1 > tk0)) {
+        *result = values[id0];
+        return true;
+      }
+      const float alpha = (clamped_ratio - tk0) / (tk1 - tk0);
+      if (!std::isfinite(alpha)) {
+        *result = values[id0];
+        return true;
+      }
       const ValueType& vk0 = values[id0];
       const ValueType& vk1 = values[id1];
       *result = internal::TrackPolicy<ValueType>::Lerp(vk0, vk1, alpha);

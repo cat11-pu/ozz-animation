@@ -25,11 +25,16 @@
 //                                                                            //
 //----------------------------------------------------------------------------//
 
+#include <cmath>
+#include <limits>
+
 #include "gtest/gtest.h"
 #include "ozz/animation/offline/animation_builder.h"
 #include "ozz/animation/offline/raw_animation.h"
 #include "ozz/animation/runtime/animation.h"
 #include "ozz/animation/runtime/sampling_job.h"
+#include "ozz/base/io/archive.h"
+#include "ozz/base/io/stream.h"
 #include "ozz/base/maths/gtest_math_helper.h"
 #include "ozz/base/maths/soa_transform.h"
 #include "ozz/base/memory/unique_ptr.h"
@@ -655,4 +660,153 @@ TEST(CacheResize, SamplingJob) {
   // Cache is too small
   context.Resize(1);
   EXPECT_FALSE(job.Validate());
+}
+
+TEST(InvalidEmptyTracks, SamplingJob) {
+  // Corrupts a default animation archive so it advertises one joint track
+  // without any keyframe data.
+  ozz::io::MemoryStream stream;
+  {
+    ozz::io::OArchive archive(&stream);
+    Animation empty;
+    archive << empty;
+  }
+
+  constexpr int kDurationOffset =
+      1 + sizeof("ozz-animation") + sizeof(uint32_t);
+  stream.Seek(kDurationOffset, ozz::io::Stream::kSet);
+  const float duration = 1.f;
+  ASSERT_EQ(stream.Write(&duration, sizeof(duration)), sizeof(duration));
+  const uint32_t num_tracks = 1;
+  ASSERT_EQ(stream.Write(&num_tracks, sizeof(num_tracks)), sizeof(num_tracks));
+
+  stream.Seek(0, ozz::io::Stream::kSet);
+  ozz::io::IArchive archive(&stream);
+  Animation animation;
+  archive >> animation;
+  ASSERT_EQ(animation.num_tracks(), 1);
+  ASSERT_TRUE(animation.timepoints().empty());
+
+  SamplingJob::Context context(1);
+  ozz::math::SoaTransform output[1] = {MakeTransform(93.f)};
+  SamplingJob job;
+  job.animation = &animation;
+  job.context = &context;
+  job.output = output;
+  job.ratio = .5f;
+
+  EXPECT_FALSE(job.Validate());
+  EXPECT_FALSE(job.Run());
+  EXPECT_SOAFLOAT3_EQ_EST(output[0].translation, 93.f, 93.f, 93.f, 93.f, 93.f,
+                          93.f, 93.f, 93.f, 93.f, 93.f, 93.f, 93.f);
+}
+
+TEST(ZeroDurationAnimation, SamplingJob) {
+  RawAnimation raw_animation;
+  raw_animation.duration = 1.f;
+  raw_animation.tracks.resize(1);
+  raw_animation.tracks[0].translations.push_back(
+      {0.f, ozz::math::Float3(0.f, 0.f, 0.f)});
+  raw_animation.tracks[0].translations.push_back(
+      {1.f, ozz::math::Float3(2.f, 4.f, 6.f)});
+
+  AnimationBuilder builder;
+  ozz::unique_ptr<Animation> source(builder(raw_animation));
+  ASSERT_TRUE(source);
+
+  ozz::io::MemoryStream stream;
+  {
+    ozz::io::OArchive archive(&stream);
+    archive << *source;
+  }
+
+  constexpr int kDurationOffset =
+      1 + sizeof("ozz-animation") + sizeof(uint32_t);
+  stream.Seek(kDurationOffset, ozz::io::Stream::kSet);
+  const float zero_duration = 0.f;
+  ASSERT_EQ(stream.Write(&zero_duration, sizeof(zero_duration)),
+            sizeof(zero_duration));
+
+  stream.Seek(0, ozz::io::Stream::kSet);
+  ozz::io::IArchive archive(&stream);
+  Animation animation;
+  archive >> animation;
+  ASSERT_FLOAT_EQ(animation.duration(), 0.f);
+
+  SamplingJob::Context context(1);
+  ozz::math::SoaTransform output[1] = {MakeTransform(93.f)};
+  SamplingJob job;
+  job.animation = &animation;
+  job.context = &context;
+  job.output = output;
+  job.ratio = 0.f / animation.duration();
+
+  EXPECT_TRUE(job.Validate());
+  EXPECT_TRUE(job.Run());
+  EXPECT_SOAFLOAT3_EQ_EST(output[0].translation, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f,
+                          0.f, 0.f, 0.f, 0.f, 0.f, 0.f);
+  EXPECT_SOAQUATERNION_EQ_EST(output[0].rotation, 0.f, 0.f, 0.f, 0.f, 0.f,
+                              0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 1.f, 1.f,
+                              1.f, 1.f);
+  EXPECT_SOAFLOAT3_EQ_EST(output[0].scale, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f,
+                          1.f, 1.f, 1.f, 1.f, 1.f);
+}
+
+TEST(BoundaryRatios, SamplingJob) {
+  RawAnimation raw_animation;
+  raw_animation.duration = 1.f;
+  raw_animation.tracks.resize(1);
+  raw_animation.tracks[0].translations.push_back(
+      {0.f, ozz::math::Float3(0.f, 0.f, 0.f)});
+  raw_animation.tracks[0].translations.push_back(
+      {1.f, ozz::math::Float3(2.f, 4.f, 6.f)});
+
+  AnimationBuilder builder;
+  ozz::unique_ptr<Animation> animation(builder(raw_animation));
+  ASSERT_TRUE(animation);
+
+  SamplingJob::Context context(1);
+  ozz::math::SoaTransform output[1];
+  SamplingJob job;
+  job.animation = animation.get();
+  job.context = &context;
+  job.output = output;
+
+  struct {
+    float ratio;
+    float expected;
+  } cases[] = {
+      {std::numeric_limits<float>::quiet_NaN(), 0.f},
+      {std::numeric_limits<float>::infinity(), 2.f},
+      {-std::numeric_limits<float>::infinity(), 0.f},
+      {-1.f, 0.f},
+      {-.25f, 0.f},
+      {0.f, 0.f},
+      {.25f, .5f},
+      {1.f, 2.f},
+      {1.25f, 2.f},
+  };
+
+  int finite_results = 0;
+  for (const auto& test : cases) {
+    job.ratio = test.ratio;
+    output[0] = MakeTransform(93.f);
+    EXPECT_TRUE(job.Validate());
+    EXPECT_TRUE(job.Run());
+    float x[4];
+    ozz::math::StorePtr(output[0].translation.x, x);
+    finite_results += std::isfinite(x[0]) && std::isfinite(x[1]) &&
+                              std::isfinite(x[2]) && std::isfinite(x[3])
+                          ? 1
+                          : 0;
+    EXPECT_SOAFLOAT3_EQ_EST(output[0].translation, test.expected, 0.f, 0.f, 0.f,
+                            test.expected * 2.f, 0.f, 0.f, 0.f,
+                            test.expected * 3.f, 0.f, 0.f, 0.f);
+    EXPECT_SOAQUATERNION_EQ_EST(output[0].rotation, 0.f, 0.f, 0.f, 0.f, 0.f,
+                                0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 1.f, 1.f,
+                                1.f, 1.f);
+    EXPECT_SOAFLOAT3_EQ_EST(output[0].scale, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f,
+                            1.f, 1.f, 1.f, 1.f, 1.f);
+  }
+  EXPECT_EQ(finite_results, OZZ_ARRAY_SIZE(cases));
 }

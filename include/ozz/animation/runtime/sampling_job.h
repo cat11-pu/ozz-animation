@@ -57,6 +57,7 @@ struct OZZ_ANIMATION_DLL SamplingJob {
   // Validates job parameters. Returns true for a valid job, or false otherwise:
   // -if any input pointer is nullptr
   // -if output range is invalid.
+  // -if the animation declares tracks but its keyframe data is incomplete.
   bool Validate() const;
 
   // Runs job's sampling task.
@@ -70,6 +71,8 @@ struct OZZ_ANIMATION_DLL SamplingJob {
   // current time in the animation , divided by animation duration.
   // This ratio is clamped before job execution in order to resolves any
   // approximation issue on range bounds.
+  // Non-finite values are deterministic: NaN maps to 0, -infinity to 0 and
+  // +infinity to 1.
   float ratio = 0.f;
 
   // The animation to sample.

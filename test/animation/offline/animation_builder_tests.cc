@@ -25,6 +25,9 @@
 //                                                                            //
 //----------------------------------------------------------------------------//
 
+#include <cmath>
+#include <limits>
+
 #include "gtest/gtest.h"
 #include "ozz/animation/offline/animation_builder.h"
 #include "ozz/animation/offline/raw_animation.h"
@@ -60,6 +63,13 @@ TEST(Error, AnimationBuilder) {
     EXPECT_FALSE(raw_animation.Validate());
 
     // Builds animation
+    EXPECT_TRUE(!builder(raw_animation));
+  }
+
+  {  // Non-finite animation duration is rejected.
+    RawAnimation raw_animation;
+    raw_animation.duration = std::numeric_limits<float>::quiet_NaN();
+    EXPECT_FALSE(raw_animation.Validate());
     EXPECT_TRUE(!builder(raw_animation));
   }
 
@@ -124,6 +134,19 @@ TEST(Build, AnimationBuilder) {
     raw_animation.tracks[0].translations.push_back(first_key);
 
     // Builds animation
+    EXPECT_FALSE(builder(raw_animation));
+  }
+
+  {  // Building an Animation with a non-finite key frame time fails.
+    RawAnimation raw_animation;
+    raw_animation.duration = 1.f;
+    raw_animation.tracks.resize(1);
+
+    RawAnimation::TranslationKey key = {
+        std::numeric_limits<float>::quiet_NaN(), ozz::math::Float3::zero()};
+    raw_animation.tracks[0].translations.push_back(key);
+
+    EXPECT_FALSE(raw_animation.Validate());
     EXPECT_FALSE(builder(raw_animation));
   }
 

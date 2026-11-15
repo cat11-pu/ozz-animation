@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 
 #include "ozz/animation/runtime/track.h"
 
@@ -39,6 +40,13 @@ bool TrackTriggeringJob::Validate() const {
   bool valid = true;
   valid &= track != nullptr;
   valid &= iterator != nullptr;
+  valid &= std::isfinite(from);
+  valid &= std::isfinite(to);
+  valid &= std::isfinite(threshold);
+  if (track != nullptr) {
+    valid &= track->ratios().size() == track->values().size();
+    valid &= track->steps().size() * 8 >= track->values().size();
+  }
   return valid;
 }
 

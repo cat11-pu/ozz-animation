@@ -205,14 +205,18 @@ template <>
 struct Extern<animation::internal::Float3Key> {
   static void Save(OArchive& _archive,
                    const animation::internal::Float3Key* _keys, size_t _count) {
-    _archive << ozz::io::MakeArray(_keys->values,
-                                   OZZ_ARRAY_SIZE(_keys->values) * _count);
+    if (_count > 0) {
+      _archive << ozz::io::MakeArray(_keys->values,
+                                     OZZ_ARRAY_SIZE(_keys->values) * _count);
+    }
   }
   static void Load(IArchive& _archive, animation::internal::Float3Key* _keys,
                    size_t _count, uint32_t _version) {
     (void)_version;
-    _archive >> ozz::io::MakeArray(_keys->values,
-                                   OZZ_ARRAY_SIZE(_keys->values) * _count);
+    if (_count > 0) {
+      _archive >> ozz::io::MakeArray(_keys->values,
+                                     OZZ_ARRAY_SIZE(_keys->values) * _count);
+    }
   }
 };
 OZZ_IO_TYPE_NOT_VERSIONABLE(animation::internal::QuaternionKey)
@@ -221,15 +225,19 @@ struct Extern<animation::internal::QuaternionKey> {
   static void Save(OArchive& _archive,
                    const animation::internal::QuaternionKey* _keys,
                    size_t _count) {
-    _archive << ozz::io::MakeArray(_keys->values,
-                                   OZZ_ARRAY_SIZE(_keys->values) * _count);
+    if (_count > 0) {
+      _archive << ozz::io::MakeArray(_keys->values,
+                                     OZZ_ARRAY_SIZE(_keys->values) * _count);
+    }
   }
   static void Load(IArchive& _archive,
                    animation::internal::QuaternionKey* _keys, size_t _count,
                    uint32_t _version) {
     (void)_version;
-    _archive >> ozz::io::MakeArray(_keys->values,
-                                   OZZ_ARRAY_SIZE(_keys->values) * _count);
+    if (_count > 0) {
+      _archive >> ozz::io::MakeArray(_keys->values,
+                                     OZZ_ARRAY_SIZE(_keys->values) * _count);
+    }
   }
 };
 }  // namespace io
